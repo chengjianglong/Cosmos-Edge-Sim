@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import mmap
+import os
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -70,6 +71,10 @@ class _Prefetcher:
 
 PREFETCH = _Prefetcher()
 
+# "bf16" streams the checkpoint weights unquantized (exact; twice the pinned RAM and PCIe traffic of
+# int8). Used for the 4B Cosmos3-Edge policy, whose ~6 GB of bf16 weights fit in RAM comfortably.
+STREAM_DTYPE = os.environ.get("LOWVRAM_STREAM_DTYPE", "int8")
+
 
 class StreamedInt8Linear(nn.Module):
     def __init__(self, in_features: int, out_features: int, name: str) -> None:
@@ -87,6 +92,11 @@ class StreamedInt8Linear(nn.Module):
         return f"in={self.in_features}, out={self.out_features}, int8-streamed"
 
     def set_weight(self, weight: torch.Tensor, work_device: torch.device) -> None:
+        if STREAM_DTYPE == "bf16":
+            self.q_cpu = _pinned_empty(weight.shape, torch.bfloat16)
+            self.q_cpu.copy_(weight.to(torch.bfloat16))
+            self.scale_cpu = None
+            return
         # Per-output-row symmetric int8, quantized in row chunks to bound GPU scratch memory.
         q_cpu = _pinned_empty(weight.shape, torch.int8)
         scale_cpu = _pinned_empty(weight.shape[0], torch.float32)
@@ -106,7 +116,7 @@ class StreamedInt8Linear(nn.Module):
         stream = PREFETCH.stream(device)
         with torch.cuda.stream(stream):
             q = self.q_cpu.to(device, non_blocking=True)
-            s = self.scale_cpu.to(device, non_blocking=True)
+            s = None if self.scale_cpu is None else self.scale_cpu.to(device, non_blocking=True)
             event = torch.cuda.Event()
             event.record(stream)
         self._staged = (device, event, q, s)
@@ -120,13 +130,14 @@ class StreamedInt8Linear(nn.Module):
         self._staged = None
         torch.cuda.current_stream(device).wait_event(event)
         q.record_stream(torch.cuda.current_stream(device))
-        s.record_stream(torch.cuda.current_stream(device))
+        if s is not None:
+            s.record_stream(torch.cuda.current_stream(device))
         # Prefetch the next layer in execution order while this one computes.
         nxt = self.index + 1
         if 0 <= self.index and nxt < len(PREFETCH.order):
             following = PREFETCH.order[nxt]
             following.stage(following.home or device)
-        w = q.to(x.dtype).mul_(s.to(x.dtype)[:, None])
+        w = q.to(x.dtype) if s is None else q.to(x.dtype).mul_(s.to(x.dtype)[:, None])
         return F.linear(x, w)
 
 
@@ -228,5 +239,9 @@ def load_streamed_weights(
     missing = sorted(k for k in targets if k not in found and not k.endswith("lm_head.weight"))
     if missing:
         raise KeyError(f"{len(missing)} streamed weights not found in checkpoint, e.g. {missing[:5]}")
-    pinned = sum(m.q_cpu.numel() for m in targets.values() if isinstance(m, StreamedInt8Linear) and m.q_cpu is not None)
-    print(f"[int8] loaded {len(found)} streamed tensors ({pinned / 2**30:.1f} GiB int8 pinned) in {time.time() - t0:.0f}s")
+    pinned = sum(
+        m.q_cpu.numel() * m.q_cpu.element_size()
+        for m in targets.values()
+        if isinstance(m, StreamedInt8Linear) and m.q_cpu is not None
+    )
+    print(f"[{STREAM_DTYPE}] loaded {len(found)} streamed tensors ({pinned / 2**30:.1f} GiB pinned) in {time.time() - t0:.0f}s")

@@ -142,6 +142,72 @@ def bimanual_frames() -> None:
     print(f"docs/media/bimanual_drift.jpg: {img.size}")
 
 
+POLICY = ROOT / "outputs" / "policy"
+DROID = ROOT / "checkpoints" / "droid_plus_lerobot_640x360_20260412" / "success"
+THEMES = {
+    "light": dict(surface="#fcfcfb", ink="#1f1f1d", muted="#6b6a65", grid="#e4e3de", s1="#2a78d6", s2="#eb6834", s3="#1baf7a"),
+    "dark": dict(surface="#1a1a19", ink="#f0efec", muted="#a3a29a", grid="#33332f", s1="#3987e5", s2="#d95926", s3="#199e70"),
+}
+
+
+def policy_eval_gif(episode: int = 3, start: int = 96, stop: int = 160) -> None:
+    """Real cameras (left) vs the policy's imagined future (right), open loop, chunk by chunk."""
+    clip = video(POLICY / f"droid_ep{episode:03d}_eval.mp4")  # frame k shows t+k+1 of each 32-frame chunk
+    half = clip.shape[2] // 2
+    frames = []
+    for t in range(start, stop, 2):  # 15 fps -> 7.5 fps, same real-time speed
+        real, imagined = clip[t][:, : half - 4], clip[t][:, half + 4 :]
+        frames.append(grid([[label(resize(real, 340), "real robot"), label(resize(imagined, 340), f"policy's imagined future (+{t % 32 + 1} frames)")]]))
+    save_gif(frames, OUT / "policy_droid_eval.gif", fps=7.5)
+
+
+def policy_dream_gif(episode: int = 22, seconds: float = 10.0) -> None:
+    clip = video(POLICY / f"droid_ep{episode:03d}_dream.mp4")
+    frames = [label(resize(clip[t], 360), f"imagined closed loop, {t / 15:.1f}s") for t in range(0, int(seconds * 15) + 1, 3)]
+    save_gif(frames, OUT / "policy_droid_dream.gif", fps=5)
+
+
+def policy_joint_chart(episode: int = 3) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(DROID / "data" / "chunk-000" / "file-000.parquet", filters=[("episode_index", "=", episode)]).to_pandas()
+    table = table.sort_values("frame_index")
+    true = np.c_[np.stack(table["action.joint_position"].to_numpy()), np.stack(table["action.gripper_position"].to_numpy())]
+    chunks = sorted(POLICY.glob(f"droid_ep{episode:03d}_eval.t*.npy"))
+    fps = 15
+    titles = [f"joint {j + 1} (rad)" for j in range(7)] + ["gripper (1 = closed)"]
+    for mode, th in THEMES.items():
+        fig, axes = plt.subplots(2, 4, figsize=(11, 4.6), sharex=True)
+        fig.patch.set_facecolor(th["surface"])
+        for d, ax in enumerate(axes.flat):
+            ax.set_facecolor(th["surface"])
+            for side in ("top", "right"):
+                ax.spines[side].set_visible(False)
+            for side in ("left", "bottom"):
+                ax.spines[side].set_color(th["grid"])
+            ax.tick_params(colors=th["muted"], labelsize=8)
+            ax.grid(axis="y", color=th["grid"], linewidth=0.8)
+            ax.plot(np.arange(len(true)) / fps, true[:, d], color=th["muted"], linewidth=1.5, label="teleoperator")
+            for i, path in enumerate(chunks):
+                t0 = int(path.stem.split(".t")[-1])
+                pred = np.load(path)
+                ax.plot((t0 + np.arange(len(pred))) / fps, pred[:, d], color=th["s1"], linewidth=2, label="policy, 2 s plan per chunk" if i == 0 else None)
+            ax.set_title(titles[d], loc="left", color=th["ink"], fontsize=9, fontweight="bold")
+        for ax in axes[1]:
+            ax.set_xlabel("seconds", color=th["muted"], fontsize=8)
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        fig.legend(handles, labels, loc="upper right", frameon=False, labelcolor=th["ink"], fontsize=9, ncol=2)
+        fig.suptitle(f"DROID episode {episode}: predicted joint targets vs the recorded teleoperation", x=0.01, ha="left", color=th["ink"], fontsize=11, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.93))
+        fig.savefig(OUT / f"policy_joints_{mode}.png", dpi=110, facecolor=th["surface"])
+        plt.close(fig)
+        print(f"docs/media/policy_joints_{mode}.png")
+
+
 def memory_chart() -> None:
     import matplotlib
 

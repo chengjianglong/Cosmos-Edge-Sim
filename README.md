@@ -7,6 +7,7 @@ Run NVIDIA Cosmos 3 world models on small Ampere GPUs. This was tested on a desk
 | [Cosmos3-Nano-Sim-Auto](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Auto) (16B) | Closed-loop driving simulator: camera video that follows WSM lane/cuboid controls, optional LiDAR | `lowvram/simauto/run_sim_auto.py` | 2 |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) (4B) | General image/text-to-video | `lowvram/run_edge.py` | 1 |
 | Cosmos3-Edge (4B), forward dynamics | Bimanual robot simulator: head-camera video that follows [Cosmos3-Nano-Sim-Bimanual](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) action files | `lowvram/bimanual/run_edge_bimanual.py` | 1 |
+| [Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) (4B) | Robot policy: camera views + joint state → next 32 joint targets and the imagined future video; open-loop, closed-loop-in-imagination and RoboLab websocket server | `lowvram/policy/droid_sim.py` | 1 |
 
 <p align="center">
   <img src="docs/media/simauto_2cam.gif" width="800" alt="Cosmos3-Nano-Sim-Auto on two 6 GB GPUs: WSM control inputs (left) and generated camera video (right) for the front-wide and cross-left cameras">
@@ -245,4 +246,68 @@ The arms move the way the actions say for the first few seconds. After that, err
 - **Use short horizons.** Rollouts are faithful for about 3–6 s. Sim-Bimanual carries a KV-cached history of all generated frames, but Edge's action pipeline takes a single conditioning frame (`CosmosActionCondition` uses only the first frame of `video`), so nothing anchors later chunks to the scene.
 - Edge is the general 4B base model, not the bimanual post-train. Actions run at 10 fps (the base model's AgiBot rate) instead of 30, and Sim-Bimanual's fingertip slots have no `agibotworld` equivalent and are dropped.
 - Only AgiBot episodes convert (rows routed to `agibotworld`, `agibot_gear_gripper*` or `camera_pose`). Other Sim-Bimanual embodiments are rejected.
+
+---
+
+## Robot action policy: Cosmos3-Edge-Policy-DROID
+
+[Cosmos3-Edge-Policy-DROID](https://huggingface.co/nvidia/Cosmos3-Edge-Policy-DROID) is Cosmos3-Edge post-trained into a "world action model" policy for the DROID Franka arm ([training recipe](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_posttrain.md)). From a language instruction, the wrist and two exterior cameras, and the current joint state, it generates the next **32 joint-position targets (2.1 s at 15 fps) together with a video of what it expects to happen**. `lowvram/policy/` runs it on **one 6 GB GPU (4.3 GB peak)**:
+
+- `edge_policy.py` wraps cosmos-framework's own policy service (`action_policy_server_robolab`), so request building, state/action transforms and sampling (4 UniPC steps, guidance 3 in the timestep interval [960, 1001]) are NVIDIA's code. Only the model setup changes: the decoder layers' bf16 weights (5.2 GB) stay in pinned RAM and stream to the GPU (`lowvram/simauto/int8_stream.py`, now with `LOWVRAM_STREAM_DTYPE=bf16` for exact weights). The framework's own `enable_layerwise_offload` refuses this checkpoint because Edge uses generation-specific text-K normalization.
+- `droid_sim.py` drives it with real DROID episodes from [nvidia/Cosmos3-DROID](https://huggingface.co/datasets/nvidia/Cosmos3-DROID), in three modes:
+  - `eval`: open loop. At every 32-frame step of a recorded episode, the policy sees the real cameras and joint state; its plan is compared with what the teleoperator did next.
+  - `dream`: closed loop in imagination. The policy's own predicted video frame and final joint targets become its next observation, so the model is its own simulator.
+  - `serve`: the RoboLab/openpi websocket server from [action_policy_droid_server.md](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_server.md), so a RoboLab client on another machine can control this GPU.
+
+<p align="center">
+  <img src="docs/media/policy_droid_eval.gif" width="688" alt="DROID episode 3: real wrist and exterior cameras (left) next to the policy's imagined future (right) while grasping a yellow cup">
+  <br>
+  <em>Open loop, episode 3 ("pour the contents from the cup into the bowl"). Left: the real cameras (wrist on top, two exterior views below). Right: the video the policy imagined from the frame at the start of each 32-step chunk while planning its actions.</em>
+</p>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/policy_joints_dark.png">
+  <img src="docs/media/policy_joints_light.png" alt="Predicted joint targets (one 2-second plan per chunk) against the recorded teleoperation for all 7 joints and the gripper of DROID episode 3">
+</picture>
+
+```bash
+A=checkpoints/droid_plus_lerobot_640x360_20260412     # the loader needs this directory name
+hf download nvidia/Cosmos3-Edge-Policy-DROID --local-dir checkpoints/Cosmos3-Edge-Policy-DROID --exclude "images/*"
+hf download nvidia/Cosmos3-DROID --repo-type dataset --local-dir $A \
+    --include "success/meta/*.json" "success/meta/tasks.parquet" "success/meta/episodes/chunk-000/file-000.parquet" \
+              "success/data/chunk-000/file-000.parquet" "success/videos/*/chunk-000/file-000.mp4"   # ~0.8 GB, 26 episodes
+PY=third_party/cosmos-framework/.venv/bin/python
+CUDA_VISIBLE_DEVICES=0 $PY lowvram/policy/droid_sim.py eval  --episode 3 --chunks 0    # whole episode
+CUDA_VISIBLE_DEVICES=0 $PY lowvram/policy/droid_sim.py dream --episode 22 --chunks 10
+uv pip install -p $PY openpi-server                                                    # once, for serve
+CUDA_VISIBLE_DEVICES=0 $PY lowvram/policy/droid_sim.py serve --port 8000
+```
+
+### Result
+
+| | Episode 3 (yellow cup → bowl) | Episode 22 (orange cup → black bowl) |
+|---|---|---|
+| Chunks (2.1 s each) | 19 | 13 |
+| Joint error of the policy's plan vs the teleoperator | **0.061 rad** (3.5°) | **0.102 rad** (5.8°) |
+| Baseline: hold the current pose | 0.103 rad | 0.172 rad |
+| Chunks where the plan beats holding still | 13 / 19 | 11 / 13 |
+| Gripper error (0–1) | 0.063 | 0.037 |
+
+- Time per chunk on one RTX A2000: about **5 s for actions only** (`serve`, as RoboLab uses it) and **21 s with the imagined video decoded** (`eval`, `dream`). Load time 13 s, peak VRAM 4.26 GiB.
+- The plans follow the operator closely once the arm is moving. They differ most when the human paused: at the start of episode 3 the operator waits 2 s and the policy starts reaching at once, and at about 10 s it closes the gripper a few seconds before the operator did.
+- These episodes come from the dataset the policy was trained on, so this checks that the low-VRAM port reproduces the model. It is not a generalization benchmark.
+
+Closed loop in imagination (episode 22, first 10 s). With nothing but its own predictions fed back, the policy reaches the orange cup and grasps it:
+
+<p align="center">
+  <img src="docs/media/policy_droid_dream.gif" width="360" alt="Closed-loop imagined rollout: the policy's own predicted wrist and exterior views as it reaches for and grasps an orange cup">
+</p>
+
+After about 10 s (5 chunks) the imagined scene degrades: the exterior views break up and the pour never appears. Each chunk sees only the previous chunk's last imagined frame, so errors compound, as in the bimanual simulation above.
+
+### What the referenced docs need that this machine can't run
+
+- **Post-training** ([DROID](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_posttrain.md), [LIBERO](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_libero_posttrain.md)): full fine-tuning with HSDP on 8–16 large GPUs and global batches of 2048–8192. Not feasible on 2× 6 GB.
+- **LIBERO closed-loop eval**: needs a LIBERO-trained checkpoint, and NVIDIA has released none. The MuJoCo simulator itself would run here.
+- **RoboLab** ([server doc](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_server.md)): the client is Isaac Lab in Docker, beyond a 6 GB GPU that also hosts the policy. `droid_sim.py serve` speaks its protocol, so a RoboLab client elsewhere can use this GPU.
 
