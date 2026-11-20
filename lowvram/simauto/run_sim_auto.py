@@ -9,16 +9,21 @@ All arguments are passed through to ``cosmos_framework.scripts.inference``; the 
 (--no-use-torch-compile --no-use-cuda-graphs --no-diffusion-cache --no-guardrails, cp=1) are
 appended automatically. Patches applied before the framework starts:
 
-  1. FlashAttention-4 gapped replay -> fa_shim (PyTorch varlen attention), lifting the sm90/sm100 check.
-  2. MoT decoder linears + lm_head -> int8 weights in pinned CPU RAM streamed to the transformer GPU;
-     token embedding kept on CPU. Only ~1 GB of small tensors stays resident on the GPU.
-  3. Wan2.2 video VAE runs on the second GPU (SIM_AUTO_VAE_GPU, default 1), loaded on CPU first,
-     encoding 4 frames per chunk and decoding in overlapping width strips (vae_tiling.py);
-     the LiDAR VAE runs on the transformer GPU (SIM_AUTO_LIDAR_GPU, default 0).
+  0. The process re-execs with nop2p/libnop2p.so preloaded: direct GPU peer copies are corrupt on
+     this machine, so CUDA is told there is no peer access and copies are staged through host RAM.
+  1. FlashAttention-4 gapped replay -> fa_shim (PyTorch memory-efficient attention, sm_80+).
+  2. MoT decoder linears -> int8 weights in pinned CPU RAM streamed to the GPU running each layer;
+     token embedding kept on CPU.
+  3. Decoder layers [SIM_AUTO_SPLIT_LAYER:] (default 30-35) run on the second GPU with their share
+     of the rolling KV cache (layer_split.py).
+  4. Wan2.2 video VAE on the second GPU (SIM_AUTO_VAE_GPU, default 1), loaded on CPU first,
+     encoding 4 frames per chunk and decoding each camera in overlapping width strips
+     (vae_tiling.py). The LiDAR VAE stays on CPU unless SIM_AUTO_LIDAR_GPU is set.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import os
 import sys
@@ -27,6 +32,32 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+
+
+def _ensure_no_p2p() -> None:
+    """Re-exec with nop2p/libnop2p.so preloaded so no CUDA library uses direct GPU peer copies.
+
+    On this machine CUDA reports peer access between the GPUs, but direct peer copies silently
+    return zeros/garbage (IOMMU/ACS blocks PCIe P2P). The framework moves tensors with plain
+    ``.to(device)`` in many places, so instead of patching each one, the shim makes
+    cudaDeviceCanAccessPeer report 0; cross-device copies then go through cudaMemcpy, which the
+    driver stages through host memory. Set SIM_AUTO_ALLOW_P2P=1 on machines where P2P works.
+    """
+    if os.environ.get("SIM_AUTO_ALLOW_P2P"):
+        return
+    lib = HERE / "nop2p" / "libnop2p.so"
+    if str(lib) in os.environ.get("LD_PRELOAD", ""):
+        return
+    if not lib.exists():
+        import subprocess
+
+        subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", str(lib), str(lib.with_name("nop2p.c"))], check=True)
+    os.environ["LD_PRELOAD"] = ":".join(filter(None, [str(lib), os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
+
+
+if __name__ == "__main__":
+    _ensure_no_p2p()
 
 os.environ.setdefault("COSMOS_TRAINING", "0")
 os.environ.setdefault("COSMOS_INTERNAL", "0")
@@ -40,9 +71,16 @@ TRANSFORMER_DEVICE = torch.device("cuda:0")
 VAE_DEVICE = torch.device(f"cuda:{os.environ.get('SIM_AUTO_VAE_GPU', '1')}")
 # The LiDAR VAE is small and the transformer GPU has spare room (its weights are streamed),
 # so it goes there by default, leaving the second GPU to the Wan video VAE.
-LIDAR_DEVICE = torch.device(f"cuda:{os.environ.get('SIM_AUTO_LIDAR_GPU', '0')}")
+# The LiDAR VAE (~0.6 GB) is only used in joint camera+LiDAR mode, so by default it stays in host
+# RAM; set SIM_AUTO_LIDAR_GPU=0 (or 1) for joint requests.
+_lidar = os.environ.get("SIM_AUTO_LIDAR_GPU", "cpu")
+LIDAR_DEVICE = torch.device("cpu" if _lidar == "cpu" else f"cuda:{_lidar}")
+# Decoder layers [SPLIT_LAYER:] run on the VAE GPU, so both GPUs share the KV cache and activations.
+SPLIT_LAYER = int(os.environ.get("SIM_AUTO_SPLIT_LAYER", "30"))
 if torch.cuda.device_count() < 2:
-    VAE_DEVICE = LIDAR_DEVICE = TRANSFORMER_DEVICE
+    VAE_DEVICE = TRANSFORMER_DEVICE
+    LIDAR_DEVICE = TRANSFORMER_DEVICE if _lidar != "cpu" else LIDAR_DEVICE
+    SPLIT_LAYER = 0
 
 
 def xfer(t: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -68,7 +106,7 @@ def _moved(fn, arg_index: int = 1, device: torch.device = VAE_DEVICE):
         x = args[arg_index]
         home = x.device
         args[arg_index] = xfer(x, device)
-        with torch.cuda.device(device):
+        with torch.cuda.device(device) if device.type == "cuda" else contextlib.nullcontext():
             out = fn(*args, **kwargs)
         return xfer(out, home) if torch.is_tensor(out) else out
 
@@ -186,6 +224,15 @@ def install_patches() -> None:
         int8_stream.load_streamed_weights(
             model.model.net, Path(checkpoint_path), inference_model._diffusers_to_net_key, TRANSFORMER_DEVICE
         )
+        if SPLIT_LAYER:
+            import layer_split
+
+            layer_split.install()
+            moved = layer_split.split_layers(
+                model.model.net.language_model.model, SPLIT_LAYER, VAE_DEVICE, TRANSFORMER_DEVICE
+            )
+            n = len(model.model.net.language_model.model.layers)
+            print(f"[split] layers {SPLIT_LAYER}-{n - 1} on {VAE_DEVICE} ({moved / 2**20:.0f} MiB resident moved)", flush=True)
         torch.cuda.empty_cache()
         release_heap()
         if os.environ.get("SIM_AUTO_DEBUG"):
@@ -256,6 +303,12 @@ LOW_VRAM_FLAGS = [
 
 def main() -> None:
     torch.cuda.set_device(TRANSFORMER_DEVICE)
+    if torch.cuda.device_count() > 1:
+        probe = torch.arange(1, 9, device=TRANSFORMER_DEVICE, dtype=torch.float32)
+        ok = bool((probe.to(VAE_DEVICE).cpu() == probe.cpu()).all())
+        print(f"[run] cross-GPU copy check: {'ok' if ok else 'BROKEN (data corrupted)'}", flush=True)
+        if not ok:
+            raise SystemExit("Direct GPU-to-GPU copies are corrupt; run without SIM_AUTO_ALLOW_P2P.")
     install_patches()
     passed = sys.argv[1:]
     extra = [f for f in LOW_VRAM_FLAGS if f.startswith("--") and f not in passed]
@@ -274,8 +327,19 @@ def main() -> None:
     t0 = time.time()
     from cosmos_framework.scripts import inference as inference_script
 
-    inference_script.main()
+    snap = os.environ.get("SIM_AUTO_MEMSNAP")  # path: dump a CUDA memory snapshot if generation fails
+    if snap:
+        torch.cuda.memory._record_memory_history(max_entries=200000, device=TRANSFORMER_DEVICE)
+    try:
+        inference_script.main()
+    except BaseException:
+        if snap:
+            torch.cuda.memory._dump_snapshot(snap)
+            print(f"[mem] snapshot written to {snap}", flush=True)
+        raise
     print(f"[run] total {time.time() - t0:.0f}s", flush=True)
+    for i in range(torch.cuda.device_count()):
+        print(f"[mem] cuda:{i} peak allocated {torch.cuda.max_memory_allocated(i) / 2**30:.2f} GiB", flush=True)
 
 
 if __name__ == "__main__":

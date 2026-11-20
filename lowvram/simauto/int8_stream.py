@@ -48,7 +48,8 @@ def _pinned_empty(shape, dtype) -> torch.Tensor:
     region.madvise(mmap.MADV_DONTFORK)
     _PINNED_REGIONS.append(region)
     t = torch.frombuffer(region, dtype=dtype, count=numel).view(shape)
-    rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 0)
+    # cudaHostRegisterPortable: pinned for every GPU's context, since layers may stream to either GPU.
+    rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), nbytes, 1)
     if int(rc) != 0:
         raise RuntimeError(f"cudaHostRegister failed: {rc}")
     return t
@@ -79,6 +80,7 @@ class StreamedInt8Linear(nn.Module):
         self.q_cpu: torch.Tensor | None = None  # [out, in] int8, pinned
         self.scale_cpu: torch.Tensor | None = None  # [out] fp32, pinned
         self.index = -1
+        self.home: torch.device | None = None  # GPU this layer runs on, if pinned to one (layer_split)
         self._staged: tuple[torch.device, torch.cuda.Event, torch.Tensor, torch.Tensor] | None = None
 
     def extra_repr(self) -> str:
@@ -122,7 +124,8 @@ class StreamedInt8Linear(nn.Module):
         # Prefetch the next layer in execution order while this one computes.
         nxt = self.index + 1
         if 0 <= self.index and nxt < len(PREFETCH.order):
-            PREFETCH.order[nxt].stage(device)
+            following = PREFETCH.order[nxt]
+            following.stage(following.home or device)
         w = q.to(x.dtype).mul_(s.to(x.dtype)[:, None])
         return F.linear(x, w)
 

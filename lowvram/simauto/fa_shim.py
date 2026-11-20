@@ -10,18 +10,41 @@ cosmos_framework/model/generator/mot/maskless_attention.py calls
     writes out[q rows] ([Nq, H, Dv]) and lse[:, q rows] ([H, Nq], natural log, fp32);
     every other row is left untouched.
 
-This module reproduces that contract with fp32 math, chunked over query rows so the score
-matrix stays bounded. It is exact up to float rounding, but slower than the fused kernel.
+This module reproduces that contract per segment with PyTorch's memory-efficient attention
+kernel (``aten._scaled_dot_product_efficient_attention``, available on sm_80+), which returns the
+log-sum-exp without materializing the score matrix. Heads are processed in groups to bound the
+temporaries. ``SIM_AUTO_ATTN=exact`` selects the older fp32 matmul path (exact, more memory).
 """
 
 from __future__ import annotations
 
+import os
 import types
 
 import torch
 
-# Max fp32 score-matrix elements materialized per chunk (~256 MB).
+# Max fp32 score-matrix elements materialized per chunk (~256 MB), exact path only.
 _SCORE_BUDGET = 64 * 1024 * 1024
+# Heads per efficient-attention launch.
+_HEAD_GROUP = int(os.environ.get("SIM_AUTO_ATTN_HEAD_GROUP", "8"))
+_EXACT = os.environ.get("SIM_AUTO_ATTN", "") == "exact"
+
+
+def _segment_efficient(q, k, v, scale):
+    """q [n,H,D], k/v [m,H,D] -> out [n,H,Dv], lse [H,n] (fp32)."""
+    n, heads = q.shape[0], q.shape[1]
+    outs, lses = [], []
+    for h0 in range(0, heads, _HEAD_GROUP):
+        h1 = min(heads, h0 + _HEAD_GROUP)
+        qh = q[:, h0:h1].transpose(0, 1).unsqueeze(0)  # [1,h,n,D]
+        kh = k[:, h0:h1].transpose(0, 1).unsqueeze(0)
+        vh = v[:, h0:h1].transpose(0, 1).unsqueeze(0)
+        o, lse, *_ = torch.ops.aten._scaled_dot_product_efficient_attention(
+            qh, kh, vh, None, True, 0.0, False, scale=scale
+        )
+        outs.append(o[0])  # [h,n,Dv]
+        lses.append(lse[0, :, :n])  # lse is padded to a multiple of 32
+    return torch.cat(outs).transpose(0, 1), torch.cat(lses)
 
 
 def _flash_attn_fwd(
@@ -60,6 +83,12 @@ def _flash_attn_fwd(
         if nq <= 0 or nk <= 0:
             continue  # nothing to attend: keep zero output / -inf lse
         q0, k0 = int(cq[i]), int(ck[i])
+        if not _EXACT and q.dtype in (torch.float16, torch.bfloat16):
+            o, row_lse = _segment_efficient(q[q0 : q0 + nq], k[k0 : k0 + nk], v[k0 : k0 + nk], scale)
+            out[q0 : q0 + nq] = o.to(out.dtype)
+            lse[:, q0 : q0 + nq] = row_lse
+            del o, row_lse
+            continue
         ks = k[k0 : k0 + nk].transpose(0, 1).float()  # [H, m, D]
         vs = v[k0 : k0 + nk].transpose(0, 1).float()  # [H, m, Dv]
         step = max(16, _SCORE_BUDGET // (heads * nk))

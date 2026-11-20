@@ -15,19 +15,23 @@ NVIDIA's runtime ([cosmos-framework](https://github.com/NVIDIA/cosmos-framework)
 
 | Patch | File |
 |---|---|
-| FlashAttention-4 "gapped replay" attention is replaced by a PyTorch varlen attention with the same contract. It is unit-tested against SDPA. | `fa_shim.py` |
-| 505 MoT decoder linears are int8 per-channel weights (12.9 GB) held in pinned CPU RAM and streamed layer by layer to GPU 0, with the next layer prefetched. The token embedding stays on CPU and the unused text `lm_head` is dropped. Only ~0.6 GB stays resident on GPU 0. | `int8_stream.py` |
-| The Wan2.2 video VAE runs on GPU 1. It is loaded on CPU first, encodes 4-frame chunks, and decodes in two overlapping width strips; the inactive strip's cache is parked on GPU 0. | `run_sim_auto.py`, `vae_tiling.py` |
-| The LiDAR VAE runs on GPU 0. | `run_sim_auto.py` |
-| All GPU↔GPU copies are staged through host RAM. See "Hardware note" below. | `run_sim_auto.py` |
+| FlashAttention-4 "gapped replay" attention is replaced by PyTorch's memory-efficient attention kernel (sm_80+), which returns the log-sum-exp without materializing scores. It is tested against an exact fp32 reference. | `fa_shim.py` |
+| 505 MoT decoder linears are int8 per-channel weights (12.9 GB) held in pinned CPU RAM and streamed layer by layer to the GPU that runs the layer, with the next layer prefetched. The token embedding stays on CPU and the unused text `lm_head` is dropped. | `int8_stream.py` |
+| The decoder layers are split across the GPUs: layers 0–29 on GPU 0, layers 30–35 on GPU 1. Each layer's rolling KV cache lives on its own GPU. | `layer_split.py` |
+| The Wan2.2 video VAE runs on GPU 1. It is loaded on CPU first, encodes 4-frame chunks, and decodes each camera separately in three overlapping width strips. Idle strip caches wait in host RAM. | `run_sim_auto.py`, `vae_tiling.py` |
+| The LiDAR VAE stays on CPU unless `SIM_AUTO_LIDAR_GPU` is set (needed only for joint camera+LiDAR requests). | `run_sim_auto.py` |
+| The launcher re-execs itself with `nop2p/libnop2p.so` preloaded, so CUDA never uses the broken direct GPU↔GPU copies. See "Hardware note" below. | `run_sim_auto.py`, `nop2p/` |
 
 ### Result
 
-| Request | Load | Generation | Total |
+| Request | Generation | Total | Peak VRAM GPU 0 / GPU 1 |
 |---|---|---|---|
-| 1 camera (`camera_front_wide_120fov`), 49 frames, 480p, RGB, first-frame conditioned | ~1 min | 3 min 10 s (~1.6 s per frame) | 263 s |
+| 1 camera (`camera_front_wide_120fov`), 49 frames, 480p, RGB, first-frame conditioned | 3 min 10 s | 263 s | (before the layer split) |
+| 2 cameras (`front_wide` + `cross_left`), 49 frames, 480p, RGB | 3 min 51 s | 315 s | 3.17 GiB / 4.15 GiB |
 
-The output follows the daytime sample's real scene and its WSM controls: road layout, oncoming cars, roadside fence and gateposts.
+The output follows the daytime sample's real scene and its WSM controls: road layout, oncoming cars, roadside fence and gateposts. With two cameras the views stay consistent: a red car passing the ego vehicle leaves the front view and appears in the cross-left view.
+
+The two GPUs work in turn, not at the same time: the layers run in sequence, so GPU 0 computes layers 0–29, then GPU 1 computes layers 30–35 and decodes video.
 
 ### Setup
 
@@ -60,17 +64,21 @@ Environment knobs:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `SIM_AUTO_VAE_GPU` | 1 | GPU for the video VAE |
-| `SIM_AUTO_LIDAR_GPU` | 0 | GPU for the LiDAR VAE |
+| `SIM_AUTO_VAE_GPU` | 1 | GPU for the video VAE and the split-off layers |
+| `SIM_AUTO_SPLIT_LAYER` | 30 | First decoder layer that runs on the second GPU (36 layers; 0 disables the split) |
+| `SIM_AUTO_LIDAR_GPU` | `cpu` | Device for the LiDAR VAE; set to 0 for joint camera+LiDAR requests |
 | `SIM_AUTO_VAE_ENCODE_FRAMES` | 4 | Frames per VAE encode chunk |
-| `SIM_AUTO_VAE_TILE_LATENT` | 30 | Latent columns per decode strip |
+| `SIM_AUTO_VAE_TILE_LATENT` | 22 | Latent columns per decode strip |
 | `SIM_AUTO_VAE_TILE_OVERLAP` | 8 | Overlap between decode strips, in latent columns |
-| `SIM_AUTO_VAE_CACHE_DEVICE` | `cuda:0` | Where the inactive strip's decoder cache waits |
+| `SIM_AUTO_VAE_CACHE_DEVICE` | `cpu` | Where idle decoder strip caches wait |
+| `SIM_AUTO_ATTN` | — | `exact` switches the attention shim to the fp32 matmul path (more memory) |
+| `SIM_AUTO_ALLOW_P2P` | — | Set to 1 to skip the no-P2P shim on machines where peer copies work |
+| `SIM_AUTO_MEMSNAP` | — | Path: record CUDA allocations on GPU 0 and dump a snapshot if generation fails |
 | `SIM_AUTO_DEBUG` | — | Set to 1 to print per-layer activation and VAE input/output statistics |
 
 ### Limits
 
-- Tested only with one camera at 480p, RGB, 49 frames. More cameras, longer rollouts and joint LiDAR are untested; the rolling KV cache and activations grow with the number of views.
+- Tested with one and two cameras at 480p, RGB, 49 frames. Three or more cameras, longer rollouts and joint LiDAR are untested; the rolling KV cache grows with the number of views. Move `SIM_AUTO_SPLIT_LAYER` down to give GPU 1 more layers if GPU 0 runs out, or up if GPU 1 does.
 - The int8 weights add some quantization error compared with NVIDIA's bf16 reference. The attention shim is slower than FA4.
 - About 13 GB of RAM stays locked for the weights. Leave about 6 GB free beyond that.
 - Run it outside Claude Code's background-task memory guard (for example `setsid nohup ... &`) or in your own terminal.
@@ -79,7 +87,8 @@ Environment knobs:
 
 CUDA reports peer access between the two A2000s, and `nvidia-smi topo -p2p r` shows "OK". But a direct `tensor.to("cuda:1")` from `cuda:0` silently returns **all zeros**; staging through host RAM works. This is the usual symptom of the IOMMU or PCIe ACS blocking P2P.
 
-- Everything here stages GPU↔GPU copies through the CPU.
+- `run_sim_auto.py` preloads `lowvram/simauto/nop2p/libnop2p.so` (built with `gcc` on first use). It makes `cudaDeviceCanAccessPeer` report 0, so PyTorch falls back to `cudaMemcpy`, which the driver stages through host memory. This covers every `.to(device)` inside the framework, not just our own code. It prints `cross-GPU copy check: ok` at startup.
+- Use the same shim for any other multi-GPU job on this machine: `LD_PRELOAD=$PWD/lowvram/simauto/nop2p/libnop2p.so python ...`
 - Disabling the IOMMU or ACS in the BIOS or kernel options would let direct copies work.
 - The same bug is why splitting Cosmos3-Edge's layers across both GPUs with `accelerate` produced noise.
 
