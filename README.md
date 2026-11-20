@@ -7,6 +7,12 @@ Run NVIDIA Cosmos 3 world models on small Ampere GPUs. This was tested on a desk
 | [Cosmos3-Nano-Sim-Auto](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Auto) (16B) | Closed-loop driving simulator: camera video that follows WSM lane/cuboid controls, optional LiDAR | `lowvram/simauto/run_sim_auto.py` | 2 |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) (4B) | General image/text-to-video | `lowvram/run_edge.py` | 1 |
 
+<p align="center">
+  <img src="docs/media/simauto_2cam.gif" width="800" alt="Cosmos3-Nano-Sim-Auto on two 6 GB GPUs: WSM control inputs (left) and generated camera video (right) for the front-wide and cross-left cameras">
+  <br>
+  <em>Cosmos3-Nano-Sim-Auto, generated on 2× RTX A2000 (6 GB). Left: the WSM control input (lanes and object boxes). Right: the generated camera video. Two cameras, 49 frames, 480p; the oncoming red car seen ahead in the front view later passes through the cross-left view.</em>
+</p>
+
 ---
 
 ## Cosmos3-Nano-Sim-Auto on 2× 6 GB GPUs
@@ -22,6 +28,29 @@ NVIDIA's runtime ([cosmos-framework](https://github.com/NVIDIA/cosmos-framework)
 | The LiDAR VAE stays on CPU unless `SIM_AUTO_LIDAR_GPU` is set (needed only for joint camera+LiDAR requests). | `run_sim_auto.py` |
 | The launcher re-execs itself with `nop2p/libnop2p.so` preloaded, so CUDA never uses the broken direct GPU↔GPU copies. See "Hardware note" below. | `run_sim_auto.py`, `nop2p/` |
 
+How the 16B model is spread over two 6 GB GPUs and system RAM:
+
+```mermaid
+flowchart LR
+    subgraph RAM["System RAM (30 GB)"]
+        W["int8 weights, 12.9 GB pinned<br/>505 decoder linears"]
+        E["token embedding<br/>LiDAR VAE"]
+        C["idle VAE decoder<br/>strip caches"]
+    end
+    subgraph G0["GPU 0 (6 GB)"]
+        L0["decoder layers 0-29<br/>+ their KV cache"]
+    end
+    subgraph G1["GPU 1 (6 GB)"]
+        L1["decoder layers 30-35<br/>+ their KV cache"]
+        V["Wan2.2 video VAE<br/>encode / tiled decode"]
+    end
+    W -- "stream one layer at a time" --> L0
+    W -- "stream one layer at a time" --> L1
+    L0 -- "hidden states (via host)" --> L1
+    L1 -- "latents (via host)" --> V
+    V <--> C
+```
+
 ### Result
 
 | Request | Generation | Total | Peak VRAM GPU 0 / GPU 1 |
@@ -29,7 +58,24 @@ NVIDIA's runtime ([cosmos-framework](https://github.com/NVIDIA/cosmos-framework)
 | 1 camera (`camera_front_wide_120fov`), 49 frames, 480p, RGB, first-frame conditioned | 3 min 10 s | 263 s | (before the layer split) |
 | 2 cameras (`front_wide` + `cross_left`), 49 frames, 480p, RGB | 3 min 51 s | 315 s | 3.17 GiB / 4.15 GiB |
 
-The output follows the daytime sample's real scene and its WSM controls: road layout, oncoming cars, roadside fence and gateposts. With two cameras the views stay consistent: a red car passing the ego vehicle leaves the front view and appears in the cross-left view.
+The output follows the daytime sample's real scene and its WSM controls: road layout, oncoming cars, roadside fence and gateposts. With two cameras the views stay consistent: an oncoming red car seen ahead in the front view later passes through the cross-left view.
+
+<p align="center">
+  <img src="docs/media/simauto_front_frames.jpg" width="800" alt="Front camera at frames 0, 24 and 48: real recording, WSM control input, and Sim-Auto output">
+  <br>
+  <em>Front camera at frames 0, 24 and 48. Top: the real recording from NVIDIA's daytime sample (only frame 0 is given to the model). Middle: the WSM control the model follows. Bottom: the generated video, which reproduces the scene layout, the oncoming traffic and the gateposts at frame 48 without seeing the real frames 1–48.</em>
+</p>
+
+Memory and GPU activity over the whole 2-camera run, sampled every 2 seconds:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/memory_timeline_dark.png">
+  <img src="docs/media/memory_timeline_light.png" width="800" alt="Timeline of VRAM per GPU, which GPU is computing, and system RAM during the 2-camera run">
+</picture>
+
+- Both GPUs stay under their 6 GB limit; GPU 1 also carries about 0.6 GB for the desktop.
+- The middle panel shows the GPUs taking turns: GPU 0 runs layers 0–29, then GPU 1 runs layers 30–35 and the VAE.
+- System RAM is the tightest resource: the pinned int8 weights plus decoder caches peak at about 27 GB of 30 GB.
 
 The two GPUs work in turn, not at the same time: the layers run in sequence, so GPU 0 computes layers 0–29, then GPU 1 computes layers 30–35 and decodes video.
 
@@ -59,6 +105,8 @@ $PY lowvram/simauto/run_sim_auto.py -i outputs/sim_auto/requests/front_49f.json 
 ```
 
 Videos are written to `outputs/sim_auto/front_49f/daytime_scene/vision_view00_*.mp4`.
+
+The README figures are rebuilt from these outputs with `third_party/cosmos-framework/.venv/bin/python scripts/make_media.py` (it reads the 2-camera run in `outputs/sim_auto/2cam_49f/`, its memory trace `outputs/sim_auto/2cam_mem.log`, and `outputs/edge_121f.mp4`).
 
 Environment knobs:
 
@@ -115,6 +163,12 @@ The official recipe (`pipe.to("cuda")`) needs about 10 GB of VRAM for the bf16 w
 |---|---|---|---|---|---|---|
 | 33 | 832×480 | 20 | 92 s | 26 s | 132 s | 2.2 GB |
 | 121 (model-card default) | 832×480 | 20 | 217 s | 94 s | 321 s | 3.0 GB |
+
+<p align="center">
+  <img src="docs/media/edge_i2v.gif" width="480" alt="Cosmos3-Edge image-to-video: dashcam view of a coastal mountain road">
+  <br>
+  <em>Cosmos3-Edge image-to-video on one 6 GB GPU: the model card's example image and prompt (a dashcam drive on a coastal mountain road), 121 frames at 832×480, shown at every 3rd frame.</em>
+</p>
 
 ```bash
 scripts/setup_env.sh            # conda env "cosmosim": Python 3.12, torch 2.11 cu128, diffusers 0.41.0
