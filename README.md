@@ -6,6 +6,7 @@ Run NVIDIA Cosmos 3 world models on small Ampere GPUs. This was tested on a desk
 |---|---|---|---|
 | [Cosmos3-Nano-Sim-Auto](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Auto) (16B) | Closed-loop driving simulator: camera video that follows WSM lane/cuboid controls, optional LiDAR | `lowvram/simauto/run_sim_auto.py` | 2 |
 | [Cosmos3-Edge](https://huggingface.co/nvidia/Cosmos3-Edge) (4B) | General image/text-to-video | `lowvram/run_edge.py` | 1 |
+| Cosmos3-Edge (4B), forward dynamics | Bimanual robot simulator: head-camera video that follows [Cosmos3-Nano-Sim-Bimanual](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) action files | `lowvram/bimanual/run_edge_bimanual.py` | 1 |
 
 <p align="center">
   <img src="docs/media/simauto_2cam.gif" width="800" alt="Cosmos3-Nano-Sim-Auto on two 6 GB GPUs: WSM control inputs (left) and generated camera video (right) for the front-wide and cross-left cameras">
@@ -184,3 +185,64 @@ Flags:
 - `--num-frames`, `--steps`, `--guidance`, `--flow-shift`, `--seed`.
 
 With two GPUs, run two Edge jobs in parallel, one with `--gpu 0` and one with `--gpu 1`.
+
+---
+
+## Bimanual robot simulation with Cosmos3-Edge
+
+[Cosmos3-Nano-Sim-Bimanual](https://huggingface.co/nvidia/Cosmos3-Nano-Sim-Bimanual) is a 16B model post-trained to simulate AgiBot bimanual robots: given the head-camera image and a sequence of arm/gripper actions, it renders what the robot would see. It targets Hopper/Blackwell GPUs. This is a lightweight substitute: the Cosmos3-Edge base model already has a `forward_dynamics` action mode with an `agibotworld` embodiment, so `lowvram/bimanual/` drives that with Sim-Bimanual's own action files on **one 6 GB GPU (3.0 GB peak)**.
+
+<p align="center">
+  <img src="docs/media/bimanual_edge.gif" width="604" alt="Real AgiBot head-camera video (left) next to the Cosmos3-Edge rollout driven by the same actions (right) for episodes 006 and 034">
+  <br>
+  <em>Left: the real robot. Right: Cosmos3-Edge given only the first frame and the recorded actions. First 6.4 s of episodes 006 (hanging a shirt) and 034 (opening a fridge).</em>
+</p>
+
+How it works:
+
+1. **`convert_actions.py`** translates Sim-Bimanual's 59-D `normalized_unified_v1` actions into the base model's 29-D `agibotworld` actions (head, both wrists, both grippers). It uses cosmos-framework's own pose and normalization code:
+   - undoes the `global_asinh` normalization;
+   - rebuilds absolute head and wrist trajectories from the 16-frame chunk-anchored deltas;
+   - resamples from 30 to 10 fps;
+   - re-encodes as framewise rot6d deltas, gripper width as an open fraction, with `quantile` normalization.
+
+   Re-encoding the rebuilt trajectories reproduces the original actions to within 2×10⁻⁷. 1–2% of the converted values fall outside the base model's training range and are clipped.
+2. **`run_edge_bimanual.py`** rolls the scene forward 16 actions (1.6 s) at a time. Each chunk is conditioned on the last generated frame of the previous one. The transformer is streamed from pinned RAM as in `run_edge.py`; the VAE stays on the GPU because a chunk is only 17 frames.
+
+```bash
+hf download nvidia/Cosmos3-Nano-Sim-Bimanual --local-dir checkpoints/Cosmos3-Nano-Sim-Bimanual-assets \
+    --include "assets/training/agibot/*"            # example episodes: actions, first frames, real videos
+A=checkpoints/Cosmos3-Nano-Sim-Bimanual-assets/assets/training/agibot
+COSMOS_TRAINING=0 third_party/cosmos-framework/.venv/bin/python lowvram/bimanual/convert_actions.py \
+    $A/actions/agibot_006_normalized_unifiedv1.json -o outputs/bimanual/agibot_006_edge29d.json
+conda activate cosmosim
+python lowvram/bimanual/run_edge_bimanual.py --gpu 0 --image $A/images/agibot_006_initial.png \
+    --actions outputs/bimanual/agibot_006_edge29d.json -o outputs/bimanual/agibot_006_edge.mp4
+```
+
+Flags: `--chunks N` (default: all), `--task "..."` (short action description for the caption), `--steps`, `--flow-shift`, `--seed`, `--gpu`.
+
+### Result
+
+All three example episodes (29 s each, 18 chunks, 289 frames at 640×352): about 60 s per chunk, **18 min per episode, 3.0 GB peak VRAM**.
+
+PSNR of the rollout against the real video, averaged per chunk:
+
+| Episode | 0–1.6 s | 1.6–3.2 s | 3.2–4.8 s | 4.8–6.4 s | 8–29 s |
+|---|---|---|---|---|---|
+| 006 (shirt on hanger) | 31.2 dB | 20.0 | 17.4 | 15.8 | 11–13 |
+| 001 (tabletop pick) | 33.8 dB | 24.7 | 23.7 | 16.9 | 12–16 |
+| 034 (fridge) | 29.7 dB | 18.9 | 16.0 | 15.1 | 10–12 |
+
+The arms move the way the actions say for the first few seconds. After that, errors compound. The arms leave the view or the scene drifts, and the model invents objects that were never there:
+
+<p align="center">
+  <img src="docs/media/bimanual_drift.jpg" width="900" alt="Episode 006 at 0, 1.6, 3.2, 6.4, 12.8 and 28.8 seconds: real robot (top) and Edge rollout (bottom)">
+</p>
+
+### Limits
+
+- **Use short horizons.** Rollouts are faithful for about 3–6 s. Sim-Bimanual carries a KV-cached history of all generated frames, but Edge's action pipeline takes a single conditioning frame (`CosmosActionCondition` uses only the first frame of `video`), so nothing anchors later chunks to the scene.
+- Edge is the general 4B base model, not the bimanual post-train. Actions run at 10 fps (the base model's AgiBot rate) instead of 30, and Sim-Bimanual's fingertip slots have no `agibotworld` equivalent and are dropped.
+- Only AgiBot episodes convert (rows routed to `agibotworld`, `agibot_gear_gripper*` or `camera_pose`). Other Sim-Bimanual embodiments are rejected.
+

@@ -7,6 +7,8 @@ Inputs (produced by the commands in README.md):
   outputs/sim_auto/2cam_49f/daytime_scene/{vision,control}_view*.mp4   2-camera Sim-Auto run
   outputs/sim_auto/2cam_mem.log                                         memory trace of that run
   outputs/edge_121f.mp4                                                 Cosmos3-Edge default example
+  outputs/bimanual/agibot_{006,034,001}_edge.mp4                         Edge bimanual rollouts
+  Sim-Bimanual ground-truth videos (checkpoints/Cosmos3-Nano-Sim-Bimanual-assets)
   NVIDIA's daytime sample (Hugging Face cache) for the real reference frames
 """
 
@@ -105,6 +107,41 @@ def edge_gif() -> None:
     save_gif(frames, OUT / "edge_i2v.gif", fps=8)
 
 
+BIMANUAL = ROOT / "outputs" / "bimanual"
+BIMANUAL_GT = ROOT / "checkpoints" / "Cosmos3-Nano-Sim-Bimanual-assets" / "assets" / "training" / "agibot" / "gt"
+EPISODES = ("006", "034", "001")
+
+
+def bimanual_pair(episode: str) -> tuple[np.ndarray, np.ndarray]:
+    """(ground truth subsampled 30 -> 10 fps, Edge rollout at 10 fps)."""
+    gt = video(next(BIMANUAL_GT.glob(f"*{episode}*")))[::3]
+    return gt, video(BIMANUAL / f"agibot_{episode}_edge.mp4")
+
+
+def bimanual_gif() -> None:
+    pairs = [bimanual_pair(e) for e in EPISODES[:2]]
+    frames = []
+    for t in range(0, 65, 2):  # first 4 chunks = 6.4 s (where the rollout still tracks the real episode), 5 fps
+        rows = [
+            [label(resize(gt[t], 300).resize((300, 165)), f"ep {e}: real robot"), label(resize(ed[t], 300).resize((300, 165)), f"ep {e}: Edge, same actions")]
+            for e, (gt, ed) in zip(EPISODES[:2], pairs)
+        ]
+        frames.append(grid(rows))
+    save_gif(frames, OUT / "bimanual_edge.gif", fps=5)
+
+
+def bimanual_frames() -> None:
+    gt, ed = bimanual_pair("006")
+    times = (0, 16, 32, 64, 128, 288)
+    tiles = [
+        [label(resize(clip[t], 260).resize((260, 143)), f"{name} {t / 10:.1f}s" if c == 0 else f"{t / 10:.1f}s") for c, t in enumerate(times)]
+        for name, clip in (("real", gt), ("Edge", ed))
+    ]
+    img = grid(tiles)
+    img.save(OUT / "bimanual_drift.jpg", quality=88)
+    print(f"docs/media/bimanual_drift.jpg: {img.size}")
+
+
 def memory_chart() -> None:
     import matplotlib
 
@@ -175,6 +212,8 @@ def main() -> None:
     sim_auto_frames()
     edge_gif()
     memory_chart()
+    bimanual_gif()
+    bimanual_frames()
 
 
 if __name__ == "__main__":
