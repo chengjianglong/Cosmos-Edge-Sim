@@ -1,0 +1,54 @@
+# DROID action-policy SFT on Cosmos3-Edge, sized for one 6 GB GPU at batch size 1.
+# Run through lowvram/train/train_droid_policy.py, which registers the
+# `action_policy_droid_edge_lowvram` experiment (NVIDIA's `action_policy_droid_nano`
+# recipe with the Edge base, LoRA, streamed frozen weights and batch 1).
+#
+# Env (set by train_droid_policy.py unless already exported):
+#   DROID_ROOT            LeRobot root named droid_plus_lerobot_640x360_20260412
+#   BASE_CHECKPOINT_PATH  DCP of nvidia/Cosmos3-Edge (convert_model_to_dcp)
+#   WAN_VAE_PATH          Wan2.2_VAE.pth (Wan-AI/Wan2.2-TI2V-5B)
+
+[job]
+task         = "vfm"
+experiment   = "action_policy_droid_edge_lowvram"
+project      = "cosmos3_action"
+group        = "action_sft_lowvram"
+name         = "action_policy_droid_edge_lowvram"
+wandb_mode   = "disabled"
+
+[model]
+precision = "bfloat16"
+
+[model.parallelism]
+data_parallel_shard_degree     = 1
+data_parallel_replicate_degree = 1
+
+[model.activation_checkpointing]
+mode           = "full"
+save_ops_regex = ["fmha"]
+
+[model.tokenizer]
+vae_path = "${oc.env:WAN_VAE_PATH}"
+
+[optimizer]
+# The reference run uses 2e-4 at global batch 8192; LoRA at batch 1 takes a higher LR
+# on a much smaller set of parameters.
+lr = 1.0e-04
+
+[scheduler]
+cycle_lengths = [100000]
+
+[dataloader_train]
+max_samples_per_batch = 1
+
+[trainer]
+max_iter        = 200
+logging_iter    = 10
+grad_accum_iter = 1      # raise for a larger effective batch (still 1 sample per step in memory)
+
+[trainer.callbacks.compile_tokenizer]
+enabled = false
+
+[checkpoint]
+load_path = "${oc.env:BASE_CHECKPOINT_PATH}"
+save_iter = 100

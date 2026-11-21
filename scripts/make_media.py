@@ -208,6 +208,39 @@ def policy_joint_chart(episode: int = 3) -> None:
         print(f"docs/media/policy_joints_{mode}.png")
 
 
+def train_loss_chart() -> None:
+    """Loss of the batch-1 DROID post-training run (outputs/train/run_loss.txt: '<iteration> <loss>')."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    data = np.loadtxt(ROOT / "outputs" / "train" / "run_loss.txt")
+    it, loss = data[:, 0], data[:, 1]
+    window = 15
+    smooth = np.convolve(loss, np.ones(window) / window, mode="valid")
+    for mode, th in THEMES.items():
+        fig, ax = plt.subplots(figsize=(8, 3.4))
+        fig.patch.set_facecolor(th["surface"])
+        ax.set_facecolor(th["surface"])
+        for side in ("top", "right"):
+            ax.spines[side].set_visible(False)
+        for side in ("left", "bottom"):
+            ax.spines[side].set_color(th["grid"])
+        ax.tick_params(colors=th["muted"], labelsize=9)
+        ax.grid(axis="y", color=th["grid"], linewidth=0.8)
+        ax.plot(it, loss, color=th["s1"], linewidth=1, alpha=0.35, label="per step (1 sample)")
+        ax.plot(it[window - 1 :], smooth, color=th["s1"], linewidth=2.2, label=f"{window}-step mean")
+        ax.set_yscale("log")
+        ax.set_xlabel("training step (batch size 1)", color=th["muted"], fontsize=9)
+        ax.set_title("DROID policy post-training on one 6 GB GPU: total loss (video + action)", loc="left", color=th["ink"], fontsize=11, fontweight="bold")
+        ax.legend(loc="upper right", frameon=False, labelcolor=th["ink"], fontsize=9)
+        fig.tight_layout()
+        fig.savefig(OUT / f"train_loss_{mode}.png", dpi=110, facecolor=th["surface"])
+        plt.close(fig)
+        print(f"docs/media/train_loss_{mode}.png")
+
+
 def memory_chart() -> None:
     import matplotlib
 

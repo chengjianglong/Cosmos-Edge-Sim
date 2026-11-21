@@ -305,9 +305,47 @@ Closed loop in imagination (episode 22, first 10 s). With nothing but its own pr
 
 After about 10 s (5 chunks) the imagined scene degrades: the exterior views break up and the pour never appears. Each chunk sees only the previous chunk's last imagined frame, so errors compound, as in the bimanual simulation above.
 
+### Post-training at batch size 1
+
+`lowvram/train/` runs NVIDIA's DROID policy post-training recipe ([action_policy_droid_posttrain.md](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_posttrain.md), experiment `action_policy_droid_nano`) on **one 6 GB GPU at batch size 1**. Batch size alone doesn't make it fit. The recipe fine-tunes the whole 2B-parameter generation tower, and its fp32 optimizer state is about 32 GB whatever the batch size. `train_droid_policy.py` registers a variant, `action_policy_droid_edge_lowvram`, and then calls the framework's `cosmos_framework.scripts.train`. The dataset class, transforms, `wam` task, losses and trainer are unchanged:
+
+| Reference recipe (256 GPUs) | Here (1× RTX A2000 6 GB) |
+|---|---|
+| Cosmos3-Nano base | Cosmos3-Edge base (the recipe doc allows either) |
+| Global batch 8192 | Batch 1 (`max_samples_per_batch=1`); raise `trainer.grad_accum_iter` for a larger effective batch |
+| Full fine-tune of the generation tower | LoRA rank 16 on its attention projections (6.4M parameters, fp32). The small heads the recipe trains (action in/out projections and embeddings, time embedder, VAE↔LLM projections, 14M parameters) train fully. |
+| FSDP-sharded weights on the GPUs | The 3.4B frozen weights stay in pinned RAM as bf16. They stream to the GPU one decoder layer at a time, in the forward pass and again in the backward pass's activation-checkpoint recompute (`StreamedLoraLinear`). The token-embedding table stays in RAM. |
+| VAE encodes 24 frames per chunk | 4 frames per chunk (same latents) |
+| EMA copy, `torch.compile`, 16 loader workers | Off, off, 2 workers |
+
+Three small fixes for this framework checkout:
+- The recipe passes `filter_dict_source_prefix`, which this revision's `get_action_droid_sft_dataset` doesn't accept, so the wrapper drops it.
+- `torchcodec` needs the CUDA NPP libraries the venv ships under `nvidia/cu13/lib`, so the wrapper preloads them.
+- MoE diagnostics callbacks read `q_proj.weight`. Streamed linears expose their pinned CPU copy there, and the callbacks then report nothing, as on any unsharded model.
+
+```bash
+PY=third_party/cosmos-framework/.venv/bin/python
+$PY lowvram/train/make_droid_subset.py     # LeRobot root indexing only the downloaded episodes (27)
+COSMOS_TRAINING=0 $PY -m cosmos_framework.scripts.convert_model_to_dcp \
+    --checkpoint-path checkpoints/Cosmos3-Edge -o checkpoints/Cosmos3-Edge-dcp      # base model -> DCP, once
+CUDA_VISIBLE_DEVICES=0 third_party/cosmos-framework/.venv/bin/torchrun --nproc_per_node=1 \
+    lowvram/train/train_droid_policy.py -- trainer.max_iter=300 checkpoint.save_iter=150
+```
+
+Checkpoints go to `outputs/train/cosmos3_action/action_sft_lowvram/action_policy_droid_edge_lowvram/checkpoints/` (212 MB each: adapters, heads and other resident tensors). Re-running the same command resumes from the latest one.
+
+**Result:** 300 steps on the 27 downloaded episodes took 7.0–7.5 s per step, about 40% of it VAE encoding. Peak VRAM was 3.77 GiB allocated (5.05 GiB reserved) and pinned RAM about 5.2 GB. The run was stopped and resumed from the step-150 checkpoint. The total loss (video + action flow matching) falls from about 20 to about 1.5 within 150 steps:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/train_loss_dark.png">
+  <img src="docs/media/train_loss_light.png" alt="Training loss over 300 batch-1 steps, falling from about 20 to about 1.5">
+</picture>
+
+This shows the training stack works end to end on this hardware. It is not a reproduction of Cosmos3-Edge-Policy-DROID: that model saw about 10,000 steps × 8192 samples of all of DROID, while this run saw 300 samples from 27 episodes.
+
 ### What the referenced docs need that this machine can't run
 
-- **Post-training** ([DROID](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_posttrain.md), [LIBERO](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_libero_posttrain.md)): full fine-tuning with HSDP on 8–16 large GPUs and global batches of 2048–8192. Not feasible on 2× 6 GB.
+- **Post-training at reference scale** ([DROID](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_posttrain.md), [LIBERO](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_libero_posttrain.md)): full fine-tuning with HSDP on 8–256 large GPUs and global batches of 2048–8192. The batch-1 LoRA variant above runs the same DROID stack; LIBERO would need the same treatment plus its dataset.
 - **LIBERO closed-loop eval**: needs a LIBERO-trained checkpoint, and NVIDIA has released none. The MuJoCo simulator itself would run here.
 - **RoboLab** ([server doc](https://github.com/NVIDIA/cosmos-framework/blob/main/docs/action_policy_droid_server.md)): the client is Isaac Lab in Docker, beyond a 6 GB GPU that also hosts the policy. `droid_sim.py serve` speaks its protocol, so a RoboLab client elsewhere can use this GPU.
 
